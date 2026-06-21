@@ -1,6 +1,6 @@
 {
   "name": "@ashulab/codegraph",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Builds a code knowledge graph (multi-language, pluggable connectors) so an agent can navigate relationships without grepping everything.",
   "type": "module",
   "license": "MIT",
