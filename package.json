@@ -1,5 +1,5 @@
 {
-  "name": "codegraph",
+  "name": "@vemec/codegraph",
   "version": "0.1.0",
   "description": "Builds a code knowledge graph (multi-language, pluggable connectors) so an agent can navigate relationships without grepping everything.",
   "type": "module",
@@ -37,6 +37,9 @@
   "files": [
     "dist"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=20"
   },
