@@ -1,0 +1,61 @@
+{
+  "name": "codegraph",
+  "version": "0.1.0",
+  "description": "Builds a code knowledge graph (multi-language, pluggable connectors) so an agent can navigate relationships without grepping everything.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Diego Ghersi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vemec/codegraph.git"
+  },
+  "homepage": "https://github.com/vemec/codegraph#readme",
+  "bugs": {
+    "url": "https://github.com/vemec/codegraph/issues"
+  },
+  "keywords": [
+    "codegraph",
+    "knowledge-graph",
+    "dependency-graph",
+    "call-graph",
+    "typescript",
+    "javascript",
+    "cli",
+    "static-analysis"
+  ],
+  "bin": {
+    "codegraph": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup",
+    "prepare": "tsup",
+    "prepublishOnly": "npm run build && npm test",
+    "dev": "tsx src/cli.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ts-morph": "^28.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.0",
+    "vitest": "^4.1.0"
+  }
+}
