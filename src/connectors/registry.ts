@@ -1,22 +1,34 @@
-import type { Connector } from './connector.ts';
-import { TypeScriptConnector } from './typescript/index.ts';
+import type { Connector } from './connector.js';
+
+import { PackageJsonConnector } from './json/index.js';
+import { TypeScriptConnector } from './typescript/index.js';
 
 /**
- * Available connector registry. To add a language (for example Go),
- * implement `Connector` and add it here - nothing else changes.
+ * Registry of available connectors. To add a language (e.g. Go), implement the
+ * `Connector` and add it here — nothing else changes.
  */
-const connectors: Connector[] = [new TypeScriptConnector()];
+const connectors: Array<Connector> = [
+  new TypeScriptConnector(),
+  new PackageJsonConnector(),
+];
 
-export function allConnectors(): Connector[] {
+export function allConnectors(): Array<Connector> {
   return connectors;
 }
 
 /** Returns only the connectors that have at least one file to parse. */
-export function applicableConnectors(files: string[]): { connector: Connector; files: string[] }[] {
-  const result: { connector: Connector; files: string[] }[] = [];
+export function applicableConnectors(
+  files: Array<string>,
+): Array<{ connector: Connector; files: Array<string> }> {
+  const result: Array<{ connector: Connector; files: Array<string> }> = [];
+
   for (const connector of connectors) {
     const matched = connector.match(files);
-    if (matched.length > 0) result.push({ connector, files: matched });
+
+    if (matched.length > 0) {
+      result.push({ connector, files: matched });
+    }
   }
+
   return result;
 }

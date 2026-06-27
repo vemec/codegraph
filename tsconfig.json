@@ -16,5 +16,5 @@
     "noEmit": true
   },
   "include": ["src", "test"],
-  "exclude": ["test/fixtures"]
+  "exclude": ["src/explorer", "test/fixtures"]
 }

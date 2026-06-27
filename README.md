@@ -1,8 +1,16 @@
-# codegraph
+<p align="center">
+  <img src="assets/logo.png" alt="codegraph" width="320" />
+</p>
 
-Build a **code knowledge graph** (multi-language, pluggable connectors) so an agent can navigate the codebase's *relationships* - who calls what, who uses what, what a change would impact - without grepping everything.
+<p align="center">
+  <strong>code knowledge graph for AI agents</strong>
+</p>
 
-Today it supports **TypeScript / JavaScript** (including JSX/React), resolved with the TS type-checker (`ts-morph`), so relationships are **exact**, not guessed by name.
+---
+
+Generates a **code knowledge graph** (multi-language, pluggable connectors) so an agent can navigate the codebase's _relationships_ —what calls what, who uses what, what a change impacts— without grepping everything.
+
+Today it supports **TypeScript / JavaScript** (including JSX/React), resolved with the TS type-checker (`ts-morph`), so calls are **exact**, not guessed by name.
 
 ## Requirements
 
@@ -10,23 +18,61 @@ Today it supports **TypeScript / JavaScript** (including JSX/React), resolved wi
 
 ## Installation
 
-As a devDependency in your repo:
+Install globally from npm to use the CLI and MCP in any repo:
 
 ```bash
-# from a tarball
-npm i -D ./codegraph-0.1.0.tgz
+npm install -g @ashulab/codegraph
+```
 
-# or as a git dependency
-npm i -D git+https://github.com/<org>/codegraph.git#v0.1.0
+Or as a devDependency in a specific repo:
+
+```bash
+npm install -D @ashulab/codegraph
 ```
 
 To develop codegraph itself:
 
 ```bash
-npm install      # builds dist/ only (prepare script)
+npm install      # compiles dist/ only (prepare script)
 npm test         # runs the tests
-npm run build    # rebuilds dist/
+npm run build    # recompiles dist/
 ```
+
+## Use it via MCP (recommended, works in any repo)
+
+The easiest way to give an agent (Claude Code, or any MCP-capable client) the graph
+is the built-in MCP server. Install once, globally:
+
+```bash
+npm install -g @ashulab/codegraph
+codegraph init          # installs the skill + registers the MCP (user-scoped)
+```
+
+`init` is idempotent and prints what it does (use `--print` for a dry run). From then
+on, in **any repo** you open, the agent has these tools:
+
+| Tool                             | What it answers                                                         |
+| -------------------------------- | ----------------------------------------------------------------------- |
+| `inspect_symbol(query)`          | a symbol's location, what it uses, who uses it, **+ its source inline** |
+| `analyze_impact(symbol, depth?)` | what breaks if you change it (transitive with `depth>1`)                |
+| `trace_path(from, to)`           | how two symbols connect                                                 |
+| `find_dead_code()`               | dead-code candidates                                                    |
+| `survey_repo()`                  | orient on an unfamiliar repo: stats + god nodes + modules               |
+| `open_explorer()`                | open the **visual** Graph Explorer in the human's browser               |
+
+The MCP is **multi-repo**: each tool targets the repo you're working in (cwd) and builds
+its graph on demand — incrementally, cached under `~/.cache/codegraph/` so your repos
+stay clean. The skill tells the agent _when_ to reach for these tools; the tools do the work.
+
+Turn the server **on/off** anytime (the skill stays installed):
+
+```bash
+codegraph disable   # unregister the MCP from Claude Code
+codegraph enable    # register it again
+codegraph status    # is it enabled?
+```
+
+To run the server manually (what `init` wires up): `codegraph mcp` (stdio).
 
 ## Usage (CLI)
 
@@ -38,18 +84,24 @@ codegraph <source> [--out ./graph]
 
 Options:
 
-| Flag | Default | What it does |
-|--|--|--|
-| `--out <dir>` | `./graph` | Output directory |
-| `--ignore a,b,c` | — | Extra dirs to ignore (in addition to `node_modules`, `dist`, etc.) |
-| `--include-tests` | off | Include tests and mocks (excluded by default) |
-| `--top <n>` | 15 | Most connected nodes to list in the index |
+| Flag              | Default   | What it does                                                  |
+| ----------------- | --------- | ------------------------------------------------------------- |
+| `--out <dir>`     | `./graph` | Output folder                                                 |
+| `--ignore a,b,c`  | —         | Extra dirs to ignore (on top of `node_modules`, `dist`, etc.) |
+| `--include-tests` | off       | Include tests and mocks (excluded by default)                 |
+| `--no-cache`      | off       | Force a full rebuild (ignore the incremental cache)           |
+| `--top <n>`       | 15        | God nodes to list in the index                                |
 
 `<source>` can be a local path, a GitHub URL, or the `org/repo` shortcut. It generates into `--out` (default `./graph`):
 
-- `graph.json` - the full graph (nodes + edges), deterministic and versionable.
-- `GRAPH_INDEX.md` - a readable map for the agent: most connected nodes + per-module breakdown.
-- `graph.html` - interactive visualization (Cytoscape.js).
+- `graph.json` — the full graph (nodes + edges), deterministic and portable (built on demand, not committed).
+- `GRAPH_INDEX.md` — a human-readable map for the agent: a `## Snapshot` of stats, God nodes (most connected symbols) + per-module breakdown.
+- `graph.html` — the **Graph Explorer**: an interactive, fully offline visualization (Sigma.js/WebGL, no CDN). Starts with the modules overview; click a module to expand its symbols, click a symbol to reveal its neighbors, search to jump anywhere.
+- `.codegraph-cache.json` — per-file cache (local only) that makes rebuilds **incremental**.
+
+### Incremental rebuilds
+
+After the first build, re-running reuses a per-file cache and re-extracts only the files whose content changed — plus the files whose edges point into them (so renames/removals stay correct). If nothing changed, no parsing happens at all. Use `--no-cache` to force a clean full build.
 
 ```bash
 codegraph . --out ./graph
@@ -58,8 +110,11 @@ codegraph . --out ./graph
 ### Query the graph
 
 ```bash
-# What breaks if I change X? (who calls / uses / extends / implements it)
+# What do I break if I modify X? (who calls / uses / extends / implements it)
 codegraph query ./graph/graph.json impact <symbol>
+
+# Transitive blast radius: everything affected within N hops
+codegraph query ./graph/graph.json impact <symbol> --depth 3
 
 # Neighborhood: what X uses and who uses X
 codegraph query ./graph/graph.json neighbors <symbol>
@@ -67,34 +122,37 @@ codegraph query ./graph/graph.json neighbors <symbol>
 # Shortest path between two symbols
 codegraph query ./graph/graph.json path <A> <B>
 
+# Symbols with no dependents in the graph (dead-code candidates)
+codegraph query ./graph/graph.json unused
+
 # Focused subgraph for a PR (Mermaid)
 codegraph mermaid ./graph/graph.json <symbol> --depth 2
 ```
 
-All queries accept `--json` for parseable output. If a name matches multiple symbols, use the exact id: `path/to/file.ts::name`.
+All queries accept `--json` for parseable output. If a name matches multiple symbols, use the exact id: `path/file.ts::name`.
 
-## Programmatic use
+## Programmatic usage
 
 ```ts
-import { buildGraph, impact, toIndexMarkdown } from 'codegraph';
+import { buildGraph, impact, toIndexMarkdown } from '@ashulab/codegraph';
 
 const { graph } = await buildGraph('.');
 const res = impact(graph, 'handleBaseError');
 console.log(res.dependents.length);
 ```
 
-## Integrating into an app (module + skill)
+## Integration into an app (module + skill)
 
-To let an agent (Claude Code) use codegraph inside **your app** (for example a frontend or service), you need **two pieces in two different places**:
+For an agent (Claude Code) to use codegraph inside **your app** (e.g. a frontend or service), **two pieces go to different places**:
 
-### 1. The module (the tool) -> as a devDependency
+### 1. The module (the tool) → as a devDependency
 
 In your app's `package.json`:
 
 ```jsonc
 {
   "devDependencies": {
-    "codegraph": "git+https://github.com/<org>/codegraph.git#v0.1.0"
+    "@ashulab/codegraph": "latest"
   },
   "scripts": {
     "graph": "codegraph . --out ./graph"
@@ -102,7 +160,7 @@ In your app's `package.json`:
 }
 ```
 
-### 2. The skill (the agent's criteria) -> in `.claude/skills/`
+### 2. The skill (the agent's judgment) → in `.claude/skills/`
 
 Copy our `skills/codegraph/SKILL.md` into your app:
 
@@ -111,9 +169,9 @@ your-app/
   .claude/
     skills/
       codegraph/
-        SKILL.md          <- tells the agent when/how to use the graph
+        SKILL.md          ← tells the agent when/how to use the graph
   graph/
-    graph.json            <- generated by `npm run graph`
+    graph.json            ← generated by `npm run graph`
     GRAPH_INDEX.md
     graph.html
   package.json
@@ -122,44 +180,47 @@ your-app/
 ### 3. Generate the graph and use it
 
 ```bash
-npm install      # pulls codegraph (devDep) and builds its dist
-npm run graph    # generates ./graph/* for the current repo
+npm install      # pulls in codegraph (devDep) and compiles its dist
+npm run graph    # generates ./graph/* for the repo itself
 ```
 
-From there, when you ask the agent "what breaks if I touch X?" or "who renders this component?", the skill points it to `./graph/graph.json` instead of grepping.
+From there, when you ask the agent "what do I break if I touch X?" or "who renders this component?", the skill guides it to query `./graph/graph.json` instead of grepping.
 
-### What to commit
+### What to version
 
-| File | Commit? | Why |
-|--|--|--|
-| `.claude/skills/codegraph/SKILL.md` | ✅ yes | the agent's criteria lives with the repo |
-| `graph/graph.json` + `GRAPH_INDEX.md` | ✅ recommended | shared freshness; CI can regenerate them (see below) |
-| `graph/graph.html` | ❌ no (gitignore) | heavy (MBs), for manual inspection, not for the agent |
+**The generated graph stays out of the repo** — it's a snapshot that goes stale, and it's built on demand (the MCP caches it centrally under `~/.cache/codegraph/`, or you generate it locally to a gitignored folder). Only the **skill** lives with the code.
+
+| File                                  | Commit it?        | Why                                                                      |
+| ------------------------------------- | ----------------- | ------------------------------------------------------------------------ |
+| `.claude/skills/codegraph/SKILL.md`   | ✅ yes            | the agent's judgment, lives with the repo                                |
+| `graph/graph.json` + `GRAPH_INDEX.md` | ❌ no (gitignore) | a snapshot that goes stale; regenerated on demand, not a source of truth |
+| `graph/graph.html`                    | ❌ no (gitignore) | the visual view, for viewing by hand, not for the agent                  |
+| `graph/.codegraph-cache.json`         | ❌ no (gitignore) | local incremental cache, rebuilt on demand                               |
 
 ```gitignore
-# your app's .gitignore
-graph/graph.html
+# your app's .gitignore — the whole generated graph
+graph/
 ```
 
-> The `SKILL.md` already points to `./graph/graph.json` (the default `graph` output). If you change `--out`, update that path in your copy of the skill.
+> The `SKILL.md` already points to `./graph/graph.json` (the default of the `graph` script). If you change `--out`, adjust that path in your copy of the skill.
 
-## Keeping it fresh
+## How to keep it fresh
 
-The graph is a snapshot of the code at generation time. A stale graph gives fast but wrong answers. Recommended model:
+The graph is a snapshot of the code at the moment it's generated. A stale graph gives confident but false answers — which is exactly why it isn't committed. The model is **generate on demand**:
 
-- **CI on `main`** regenerates and commits `graph.json` on every merge (artifact owner, no one relies on memory).
-- The **agent regenerates on demand** on its branch (to a gitignored path) when it detects the graph is stale - that is already built into the skill.
+- With the **MCP** (recommended), the agent gets a fresh graph automatically: it's built per-repo on first use and kept up to date incrementally, cached under `~/.cache/codegraph/`.
+- With the **CLI**, re-run `codegraph . --out ./graph` (incremental, so it's cheap) whenever you want the latest — the agent does this on its own when it detects the graph is stale, to a gitignored path.
 
 ## Architecture
 
-- `model/` - the graph, language-agnostic (the contract).
-- `connectors/` - one connector per language behind the `Connector` interface. TS uses `ts-morph` in-process.
-- `sources/` - source resolution (local / GitHub).
-- `outputs/` - json, markdown index, HTML, Mermaid.
-- `query/` - impact / neighbors / path.
+- `model/` — the graph, language-agnostic (the contract).
+- `connectors/` — one connector per language behind the `Connector` interface. TS uses `ts-morph` in-process.
+- `sources/` — source resolution (local / GitHub).
+- `outputs/` — json, markdown index, HTML, Mermaid.
+- `query/` — impact / neighbors / path.
 
-**Adding a language:** languages with a Node-friendly parser implement the `Connector` interface (in-process). Languages with a native toolchain (for example Go with `go/packages`) ship as a separate binary that emits the **same graph JSON schema** - the cross-language contract.
+**Adding a language:** languages with a Node-friendly parser implement the `Connector` interface (in-process). Languages with a native toolchain (e.g. Go with `go/packages`) ship as a separate binary that emits the **same graph JSON schema** — the cross-language contract.
 
-## Edge kinds
+## Edge types
 
-`contains` (file declares symbol) · `imports` · `calls` · `renders` (a component uses another via JSX `<Comp/>`) · `extends` · `implements` · `references` (`new X`)
+`contains` (file declares symbol) · `imports` (includes re-exports `export … from`) · `calls` · `renders` (component uses another via JSX `<Comp/>`) · `extends` · `implements` · `references` (`new X`, or a function/component passed **by reference** —callback, `onClick={save}` handler—, or an enum used as a value; for exported symbols).

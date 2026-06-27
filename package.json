@@ -1,6 +1,6 @@
 {
   "name": "@ashulab/codegraph",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Builds a code knowledge graph (multi-language, pluggable connectors) so an agent can navigate relationships without grepping everything.",
   "type": "module",
   "license": "MIT",
@@ -44,6 +44,11 @@
     "node": ">=20"
   },
   "scripts": {
+    "build:explorer": "node scripts/build-explorer.mjs",
+    "prebuild": "pnpm build:explorer",
+    "predev": "pnpm build:explorer",
+    "pretest": "pnpm build:explorer",
+    "pretypecheck": "pnpm build:explorer",
     "build": "tsup",
     "prepare": "tsup",
     "prepublishOnly": "npm run build && npm test",
@@ -52,10 +57,19 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@clack/prompts": "^0.11.0",
+    "@modelcontextprotocol/sdk": "^1.18.1",
+    "chalk": "^5.6.2",
     "ts-morph": "^28.0.0"
   },
   "devDependencies": {
+    "@sigma/edge-curve": "^3.1.0",
+    "@sigma/node-border": "^3.0.0",
     "@types/node": "^25.0.0",
+    "esbuild": "^0.25.12",
+    "graphology": "^0.26.0",
+    "graphology-layout-forceatlas2": "^0.10.1",
+    "sigma": "^3.0.2",
     "tsup": "^8.5.1",
     "tsx": "^4.22.4",
     "typescript": "^6.0.0",

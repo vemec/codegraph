@@ -52,7 +52,7 @@ describe('seguridad: HTML no inyectable', () => {
     const { toHtml } = await import('../src/outputs/html.ts');
     const graph = {
       meta: { source: '</script><img src=x onerror=alert(1)>', generatedAt: 'x', languages: ['ts'], counts: { nodes: 1, edges: 0 } },
-      nodes: [{ id: 'a</script>', kind: 'function' as const, name: '</script>evil', file: 'a.ts', line: 1, module: '.', lang: 'ts', exported: true }],
+      nodes: [{ id: 'a</script>', kind: 'function' as const, name: '</script>evil', file: 'a.ts', line: 1, endLine: 1, module: '.', lang: 'ts', exported: true }],
       edges: [],
     };
     const html = toHtml(graph);
