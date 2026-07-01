@@ -322,6 +322,65 @@ export function blastRadius(
   return { node, alternatives: matches.slice(1), reached, maxDepth };
 }
 
+export interface DiffImpactResult {
+  /** Relative file paths from the git diff */
+  changedFiles: Array<string>;
+  /** Symbols whose containing file was in the diff */
+  changedSymbols: Array<GraphNode>;
+  /** Symbols that depend on any changed symbol, BFS up to `depth` hops */
+  impacted: Array<{ node: GraphNode; distance: number; via: GraphEdge }>;
+}
+
+/**
+ * Given a list of changed files (from `git diff --name-only`), returns the
+ * symbols in those files plus their transitive dependents up to `depth` hops.
+ * Useful for impact analysis scoped to a PR or a commit range.
+ */
+export function diffImpact(
+  graph: Graph,
+  changedFiles: Array<string>,
+  depth = 1,
+): DiffImpactResult {
+  const { byId, revDepAdj } = getIndex(graph);
+  const fileSet = new Set(changedFiles);
+
+  const changedSymbols = graph.nodes.filter(
+    (n) => fileSet.has(n.file) && n.kind !== 'external',
+  );
+
+  const visited = new Set<string>(changedSymbols.map((n) => n.id));
+  const impacted: Array<{ node: GraphNode; distance: number; via: GraphEdge }> =
+    [];
+
+  let frontier = changedSymbols.map((n) => n.id);
+
+  for (let dist = 1; frontier.length > 0 && dist <= depth; dist += 1) {
+    const next: Array<string> = [];
+
+    for (const id of frontier) {
+      for (const { from, edge } of revDepAdj.get(id) ?? []) {
+        const n = byId.get(from);
+
+        if (n && !visited.has(from)) {
+          visited.add(from);
+          impacted.push({ node: n, distance: dist, via: edge });
+          next.push(from);
+        }
+      }
+    }
+
+    frontier = next;
+  }
+
+  impacted.sort((a, b) =>
+    a.distance !== b.distance
+      ? a.distance - b.distance
+      : a.node.name.localeCompare(b.node.name),
+  );
+
+  return { changedFiles, changedSymbols, impacted };
+}
+
 /** Shortest path (BFS, directed edges) between two symbols. */
 export function shortestPath(
   graph: Graph,

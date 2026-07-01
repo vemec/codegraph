@@ -1,5 +1,6 @@
 import type { Graph } from './model/types.js';
 
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,13 +11,14 @@ import * as p from '@clack/prompts';
 import chalk from 'chalk';
 
 import { buildGraph, type BuildCache, type BuildEvent } from './build.js';
-import { toHtml } from './outputs/html.js';
+import { toHtml, type DiffInfo } from './outputs/html.js';
 import { toIndexMarkdown } from './outputs/index.js';
 import { toJson } from './outputs/json.js';
 import { toMermaid } from './outputs/mermaid.js';
 import { computeStats, edgeKindsByFreq } from './outputs/stats.js';
 import {
   blastRadius,
+  diffImpact,
   findNodes,
   impact,
   neighbors,
@@ -25,6 +27,12 @@ import {
   unused,
   type Relation,
 } from './query/query.js';
+import {
+  buildEmbeddings,
+  hasEmbeddings,
+  semanticSearch,
+} from './query/semantic.js';
+import { getChangedFiles } from './util/git-diff.js';
 import { openInBrowser } from './util/open.js';
 import { VERSION } from './version.js';
 
@@ -124,18 +132,22 @@ export function helpText(): string {
 ${c.bold('GENERATE')}
   ${cmd('codegraph')} ${arg('<source>')} ${dim('[options]')}        Build the graph of a repo
     ${dim('<source>')}            local path · GitHub URL · ${arg('org/repo')} shorthand
-    ${cmd('--out')} ${arg('<dir>')}          output folder ${dim('(default ./graph)')}
+    ${cmd('--out')} ${arg('<dir>')}          output folder ${dim('(default ~/.cache/codegraph/<hash>)')}
     ${cmd('--ignore')} ${arg('a,b,c')}       extra dirs to ignore ${dim('(on top of node_modules, dist…)')}
     ${cmd('--include-tests')}      include tests and mocks ${dim('(excluded by default)')}
     ${cmd('--no-cache')}           force a full rebuild ${dim('(ignore the incremental cache)')}
     ${cmd('--top')} ${arg('<n>')}            god nodes in the index ${dim('(default 15)')}
     ${cmd('--open')}               open the Graph Explorer in the browser when done
+    ${cmd('--diff')} ${arg('<range>')}         embed a git diff overlay ${dim(`(e.g. HEAD~1..HEAD)`)} — highlights changed/impacted symbols
+    ${cmd('--with-embeddings')}    generate semantic embeddings (enables ${cmd('search')} query and MCP ${cmd('search_symbols')})
 
 ${c.bold('QUERY')} ${dim('(all accept --json for parseable output)')}
   ${cmd('codegraph query')} ${arg('<graph.json>')} ${cmd('impact')} ${arg('<symbol>')} ${dim('[--depth N]')}   what breaks if I change it? (transitive with --depth)
   ${cmd('codegraph query')} ${arg('<graph.json>')} ${cmd('neighbors')} ${arg('<symbol>')}   what X uses and who uses X
   ${cmd('codegraph query')} ${arg('<graph.json>')} ${cmd('path')} ${arg('<A> <B>')}          shortest path between two
   ${cmd('codegraph query')} ${arg('<graph.json>')} ${cmd('unused')}                symbols with no dependents
+  ${cmd('codegraph query')} ${arg('<graph.json>')} ${cmd('diff')} ${dim('[--base HEAD~1] [--head HEAD] [--depth N]')}   symbols changed + their impact
+  ${cmd('codegraph query')} ${arg('<graph.json>')} ${cmd('search')} ${arg('"<free text>"')} ${dim('[--limit N]')}      semantic similarity search (needs --with-embeddings)
 
 ${c.bold('VISUALIZE')}
   ${cmd('codegraph open')} ${dim('[dir]')}                    open the Graph Explorer (graph.html) in the browser ${dim('(default ./graph)')}
@@ -279,12 +291,58 @@ export function summaryText(
   ].join('\n');
 }
 
+function buildDiffInfo(
+  graph: Graph,
+  source: string,
+  diffFlag: string | undefined,
+): DiffInfo | undefined {
+  if (!diffFlag) {
+    return undefined;
+  }
+
+  const dotdot = diffFlag.indexOf('..');
+  const diffBase = dotdot >= 0 ? diffFlag.slice(0, dotdot) : 'HEAD~1';
+  const diffHead =
+    (dotdot >= 0 ? diffFlag.slice(dotdot + 2) : diffFlag) || 'HEAD';
+
+  try {
+    const changedFiles = getChangedFiles(
+      path.resolve(source),
+      diffBase,
+      diffHead,
+    );
+    const dr = diffImpact(graph, changedFiles, 1);
+
+    return {
+      base: diffBase,
+      head: diffHead,
+      changedIds: dr.changedSymbols.map((n) => n.id),
+      impactedIds: dr.impacted.map((r) => r.node.id),
+    };
+  } catch (err) {
+    process.stderr.write(
+      `⚠ --diff: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+
+    return undefined;
+  }
+}
+
 export async function cmdBuild(
   source: string,
   args: Array<string>,
   opts: { intro?: boolean } = {},
 ): Promise<void> {
-  const out = path.resolve(flag(args, '--out', './graph')!);
+  const defaultOut = path.join(
+    os.homedir(),
+    '.cache',
+    'codegraph',
+    createHash('sha256')
+      .update(path.resolve(source))
+      .digest('hex')
+      .slice(0, 16),
+  );
+  const out = path.resolve(flag(args, '--out', defaultOut)!);
   const ignore = flag(args, '--ignore')
     ?.split(',')
     .map((s) => s.trim())
@@ -402,13 +460,34 @@ export async function cmdBuild(
     path.join(out, 'GRAPH_INDEX.md'),
     toIndexMarkdown(graph, top),
   );
+
+  const diffInfo = buildDiffInfo(graph, source, flag(args, '--diff'));
+
   // eslint-disable-next-line security/detect-non-literal-fs-filename
-  fs.writeFileSync(htmlPath, toHtml(graph));
+  fs.writeFileSync(htmlPath, toHtml(graph, { diff: diffInfo }));
   // eslint-disable-next-line security/detect-non-literal-fs-filename
   fs.writeFileSync(cachePath, JSON.stringify(nextCache));
 
   if (hasFlag(args, '--open')) {
     openInBrowser(htmlPath);
+  }
+
+  if (hasFlag(args, '--with-embeddings')) {
+    if (interactiveTerminal) {
+      p.log.step('Generating semantic embeddings…');
+    } else {
+      process.stderr.write('  generating embeddings…\n');
+    }
+
+    await buildEmbeddings(graph, out);
+
+    if (interactiveTerminal) {
+      p.log.step(
+        chalk.dim('Embeddings ready (search_symbols / codegraph query search)'),
+      );
+    } else {
+      process.stderr.write('  embeddings ready\n');
+    }
   }
 
   if (interactiveTerminal) {
@@ -459,7 +538,10 @@ type QueryContext = {
   json: boolean;
 };
 
-const queryHandlers: Record<string, (ctx: QueryContext) => void> = {
+const queryHandlers: Record<
+  string,
+  (ctx: QueryContext) => Promise<void> | void
+> = {
   impact({ graph, params, rest, json }) {
     const depth = intFlag(rest, '--depth', 1);
 
@@ -615,6 +697,121 @@ const queryHandlers: Record<string, (ctx: QueryContext) => void> = {
     }
   },
 
+  async search({ graph, params: [query = ''], rest, json }) {
+    const limit = intFlag(rest, '--limit', 10);
+
+    if (!query) {
+      process.stderr.write(
+        'Usage: codegraph query <graph.json> search "<query>"\n',
+      );
+
+      return;
+    }
+
+    // graph.json is at <outDir>/graph.json — derive outDir from the file path
+    const graphFile = rest[0] ?? '';
+    const outDir = path.dirname(path.resolve(graphFile));
+
+    if (!hasEmbeddings(outDir)) {
+      process.stderr.write(
+        `No embeddings found at ${outDir}.\n` +
+          `Run: codegraph <source> --out <dir> --with-embeddings\n`,
+      );
+
+      return;
+    }
+
+    const results = await semanticSearch(graph, query, outDir, limit);
+
+    if (json) {
+      process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);
+
+      return;
+    }
+
+    if (results.length === 0) {
+      process.stdout.write(chalk.dim('No results.\n'));
+
+      return;
+    }
+
+    process.stdout.write(
+      `# Semantic search: "${query}" — top ${results.length}\n\n`,
+    );
+
+    for (const r of results) {
+      const score = (r.score * 100).toFixed(1);
+      const sig = r.node.signature ? chalk.dim(` · ${r.node.signature}`) : '';
+
+      process.stdout.write(
+        `  ${chalk.dim(`${score}%`).padEnd(8)} ${chalk.cyan(r.node.kind.padEnd(10))} ${r.node.name}${sig} ${chalk.dim(`(${r.node.file}:${r.node.line})`)}\n`,
+      );
+    }
+  },
+
+  diff({ graph, rest, json }) {
+    const base = flag(rest, '--base', 'HEAD~1') ?? 'HEAD~1';
+    const head = flag(rest, '--head', 'HEAD') ?? 'HEAD';
+    const depth = intFlag(rest, '--depth', 1);
+    const root = flag(rest, '--root') ?? graph.meta.root ?? process.cwd();
+    const changed = getChangedFiles(root, base, head);
+
+    if (changed.length === 0) {
+      process.stdout.write(`No files changed between ${base} and ${head}\n`);
+
+      return;
+    }
+
+    const res = diffImpact(graph, changed, depth);
+
+    if (json) {
+      process.stdout.write(`${JSON.stringify(res, null, 2)}\n`);
+
+      return;
+    }
+
+    process.stdout.write(
+      `# Diff impact: ${chalk.bold(`${base}..${head}`)}\n\n`,
+    );
+    process.stdout.write(
+      `Changed files (${chalk.bold(String(changed.length))}):\n`,
+    );
+
+    for (const f of changed) {
+      process.stdout.write(`  ${chalk.dim(f)}\n`);
+    }
+
+    process.stdout.write(
+      `\nChanged symbols in graph (${chalk.bold(String(res.changedSymbols.length))}):\n`,
+    );
+
+    if (res.changedSymbols.length === 0) {
+      process.stdout.write(
+        chalk.dim('  (no symbols from changed files found in graph)\n'),
+      );
+    } else {
+      for (const n of res.changedSymbols) {
+        process.stdout.write(
+          `  ${chalk.cyan(n.kind.padEnd(10))} ${n.name} ${chalk.dim(`(${n.file}:${n.line})`)}\n`,
+        );
+      }
+    }
+
+    process.stdout.write(
+      `\nImpacted symbols (${chalk.bold(String(res.impacted.length))})${depth > 1 ? chalk.dim(` — depth ${depth}`) : ''}:\n`,
+    );
+
+    if (res.impacted.length === 0) {
+      process.stdout.write(chalk.dim('  (none)\n'));
+    } else {
+      for (const r of res.impacted) {
+        process.stdout.write(
+          `  ${chalk.dim(`[${r.distance}]`)} ${chalk.cyan(r.via.kind.padEnd(11))} ${r.node.name}${r.node.exported ? chalk.yellow(' [exported]') : ''} ${chalk.dim(`(${r.node.file}:${r.node.line})`)}\n`,
+        );
+      }
+    }
+  },
+
   path({ graph, params, json }) {
     for (const q of [params[0], params[1]]) {
       const ms = findNodes(graph, q ?? '');
@@ -648,7 +845,7 @@ const queryHandlers: Record<string, (ctx: QueryContext) => void> = {
   },
 };
 
-export function cmdQuery(args: Array<string>): void {
+export async function cmdQuery(args: Array<string>): Promise<void> {
   const json = args.includes('--json');
   const rest = args.filter((a) => a !== '--json');
   const [file, sub, ...params] = rest;
@@ -664,7 +861,7 @@ export function cmdQuery(args: Array<string>): void {
     throw new Error(helpText());
   }
 
-  handler({ graph, params, rest, json });
+  await handler({ graph, params, rest, json });
 }
 
 export function cmdMermaid(args: Array<string>): void {
@@ -1081,7 +1278,7 @@ export async function main(): Promise<void> {
   }
 
   if (cmd === 'query') {
-    cmdQuery(args);
+    await cmdQuery(args);
 
     return;
   }

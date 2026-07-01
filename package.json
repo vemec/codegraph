@@ -1,7 +1,9 @@
 {
   "name": "@ashulab/codegraph",
-  "version": "0.2.0",
-  "description": "Builds a code knowledge graph (multi-language, pluggable connectors) so an agent can navigate relationships without grepping everything.",
+  "version": "0.2.1",
+  "description": "Builds a code knowledge graph (multi-language, pluggable connectors) so an agent navigates relationships without grepping everything. TS/JS resolved with the type-checker, MCP server, and an offline Graph Explorer.",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
   "type": "module",
   "license": "MIT",
   "author": "Diego Ghersi",
@@ -24,24 +26,27 @@
     "static-analysis"
   ],
   "bin": {
-    "codegraph": "dist/cli.js"
+    "codegraph": "lib/cli.js"
   },
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "types": "./lib/index.d.ts",
+      "import": "./lib/index.js"
     }
   },
+  "imports": {
+    "#src/*": "./src/*.ts"
+  },
   "files": [
-    "dist"
+    "lib",
+    "skills",
+    "CHANGELOG.md"
   ],
   "publishConfig": {
     "access": "public"
   },
   "engines": {
-    "node": ">=20"
+    "node": "^20.12 || ^22.12 || ^24.11.1 || ^25.0.0"
   },
   "scripts": {
     "build:explorer": "node scripts/build-explorer.mjs",
@@ -50,15 +55,16 @@
     "pretest": "pnpm build:explorer",
     "pretypecheck": "pnpm build:explorer",
     "build": "tsup",
-    "prepare": "tsup",
-    "prepublishOnly": "npm run build && npm test",
+    "prepare": "pnpm build:explorer && pnpm exec tsup",
+    "prepublishOnly": "pnpm build && pnpm test",
     "dev": "tsx src/cli.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@clack/prompts": "^0.11.0",
-    "@modelcontextprotocol/sdk": "^1.18.1",
+    "@clack/prompts": "^1.5.1",
+    "@huggingface/transformers": "^4.2.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "chalk": "^5.6.2",
     "ts-morph": "^28.0.0"
   },
@@ -69,6 +75,7 @@
     "esbuild": "^0.25.12",
     "graphology": "^0.26.0",
     "graphology-layout-forceatlas2": "^0.10.1",
+    "graphology-types": "^0.24.8",
     "sigma": "^3.0.2",
     "tsup": "^8.5.1",
     "tsx": "^4.22.4",

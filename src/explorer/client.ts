@@ -31,6 +31,7 @@ interface RawNode {
   name: string;
   file: string;
   line: number;
+  endLine?: number;
   module: string;
   lang: string;
   exported: boolean;
@@ -59,6 +60,13 @@ interface RawGraph {
 declare global {
   interface Window {
     __GRAPH__: RawGraph;
+    __SOURCES__?: Record<string, string>;
+    __DIFF__?: {
+      base: string;
+      head: string;
+      changedIds: Array<string>;
+      impactedIds: Array<string>;
+    };
   }
 }
 
@@ -209,14 +217,50 @@ const activeKinds = new Set<string>(DRAWN_KINDS);
 let showExternals = false;
 // How nodes are coloured: by module (distinct hue per folder) or by architectural layer.
 let colorMode: 'layer' | 'module' = 'module';
+let minDegreeFilter = 0;
+
+let moduleFilterRx: RegExp | null = null;
+
+// eslint-disable-next-line no-underscore-dangle
+const RAW_DIFF = window.__DIFF__;
+
+const diffChangedSet = RAW_DIFF ? new Set(RAW_DIFF.changedIds) : null;
+
+const diffImpactedSet = RAW_DIFF ? new Set(RAW_DIFF.impactedIds) : null;
+
+let diffMode = false;
 
 /** Group colour under the current mode: a distinct hue per module, or its layer's colour. */
 const groupColor = (g: string): string =>
   colorMode === 'layer'
     ? LAYER_COLORS[layerByGroup.get(g) ?? 'Foundation']
     : colorOfGroup(g);
+
 const colorOfNode = (n: RawNode): string =>
   n.kind === 'external' ? '#8b949e' : groupColor(groupOf(n.module));
+
+function isNodeVisible(id: string): boolean {
+  if (id.startsWith('mod:')) {
+    return true;
+  }
+
+  const n = byId.get(id);
+
+  if (!n) {
+    return true;
+  }
+
+  if ((degree.get(id) ?? 0) < minDegreeFilter) {
+    return false;
+  }
+
+  if (moduleFilterRx) {
+    return moduleFilterRx.test(n.module);
+  }
+
+  return true;
+}
+
 const positions = new Map<string, { x: number; y: number }>();
 
 let firstRender = true;
@@ -400,6 +444,73 @@ const sigma = new Sigma(graph, container, {
       };
     }
 
+    if (diffMode && diffChangedSet && diffImpactedSet) {
+      if (node.startsWith('mod:')) {
+        const g = node.slice(4);
+        const mbrs = membersOfGroup.get(g) ?? [];
+
+        if (mbrs.some((id) => diffChangedSet.has(id))) {
+          return {
+            ...data,
+            color: '#e3b341',
+            borderColor: '#e3b341',
+            forceLabel: true,
+            zIndex: 3,
+          };
+        }
+
+        if (mbrs.some((id) => diffImpactedSet.has(id))) {
+          return {
+            ...data,
+            color: '#f85149',
+            borderColor: '#f85149',
+            forceLabel: true,
+            zIndex: 2,
+          };
+        }
+
+        return {
+          ...data,
+          color: DIM_NODE,
+          borderColor: BG,
+          labelColor: DIM_LABEL,
+          label: '',
+          zIndex: 0,
+        };
+      }
+
+      if (diffChangedSet.has(node)) {
+        return {
+          ...data,
+          color: '#e3b341',
+          borderColor: '#e3b341',
+          labelColor: '#fff',
+          forceLabel: true,
+          zIndex: 3,
+        };
+      }
+
+      if (diffImpactedSet.has(node)) {
+        return {
+          ...data,
+          color: '#f85149',
+          borderColor: '#f85149',
+          labelColor: '#fff',
+          forceLabel: true,
+          zIndex: 2,
+        };
+      }
+
+      return {
+        ...data,
+        color: DIM_NODE,
+        borderColor: BG,
+        labelColor: DIM_LABEL,
+        label: '',
+        zIndex: 0,
+      };
+    }
+
     // a node still easing in/out of focus stays the hero while t > 0.
     if (t > 0.01) {
       return hero(data);
@@ -445,6 +556,21 @@ const sigma = new Sigma(graph, container, {
           zIndex: 2,
           size: Math.max(2, data.size ?? 1),
         };
+      }
+
+      return { ...data, color: DIM_EDGE, zIndex: 0 };
+    }
+
+    if (diffMode && diffChangedSet && diffImpactedSet) {
+      const [s, t] = graph.extremities(edge);
+
+      if (
+        diffChangedSet.has(s) ||
+        diffImpactedSet.has(s) ||
+        diffChangedSet.has(t) ||
+        diffImpactedSet.has(t)
+      ) {
+        return { ...data, zIndex: 2 };
       }
 
       return { ...data, color: DIM_EDGE, zIndex: 0 };
@@ -532,16 +658,20 @@ function presentNodes(): { nodes: Set<string>; superNodes: Set<string> } {
   for (const g of groupNames) {
     if (expandedModules.has(g)) {
       for (const id of membersOfGroup.get(g) ?? []) {
-        nodes.add(id);
+        if (isNodeVisible(id)) {
+          nodes.add(id);
+        }
       }
-    } else {
+    } else if ((membersOfGroup.get(g) ?? []).some((id) => isNodeVisible(id))) {
       superNodes.add(`mod:${g}`);
       nodes.add(`mod:${g}`);
     }
   }
 
   for (const id of visibleSymbols) {
-    nodes.add(id);
+    if (isNodeVisible(id)) {
+      nodes.add(id);
+    }
   }
 
   return { nodes, superNodes };
@@ -886,6 +1016,112 @@ function clearBlast(): void {
   bumpFocus();
 }
 
+/** Returns true when `line[pos]` is a quote character that closes a string —
+ *  i.e. it is NOT preceded by an odd number of backslashes. */
+function isUnescapedQuote(line: string, pos: number, q: string): boolean {
+  if (line[pos] !== q) {
+    return false;
+  }
+
+  let bs = 0;
+
+  while (bs < pos && line[pos - 1 - bs] === '\\') {
+    bs += 1;
+  }
+
+  return bs % 2 === 0;
+}
+
+/** Applies a minimal TS/JS syntax colouring to a raw source snippet.
+ *  Returns HTML-escaped output with <span class="src-*"> wrappers. */
+function highlightTs(raw: string): string {
+  const ESC: Record<string, string> = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    "'": '&#39;',
+  };
+  const esc2 = (s: string) => s.replace(/[&<>']/g, (c) => ESC[c]!);
+
+  return raw
+    .split('\n')
+    .map((line, i) => {
+      const ln = `<span class="src-ln">${i + 1}</span>`;
+
+      let out = '';
+
+      let j = 0;
+
+      while (j < line.length) {
+        if (line[j] === '"' || line[j] === "'") {
+          const q = line[j]!;
+
+          let k = j + 1;
+
+          while (k < line.length && !isUnescapedQuote(line, k, q)) {
+            k += 1;
+          }
+
+          if (k < line.length) {
+            k += 1;
+          }
+
+          out += `<span class="src-st">${esc2(line.slice(j, k))}</span>`;
+          j = k;
+        } else if (line[j] === '`') {
+          let k = j + 1;
+
+          while (k < line.length && line[k] !== '`') {
+            k += 1;
+          }
+
+          if (k < line.length) {
+            k += 1;
+          }
+
+          out += `<span class="src-st">${esc2(line.slice(j, k))}</span>`;
+          j = k;
+        } else if (line[j] === '/' && line[j + 1] === '/') {
+          out += `<span class="src-cm">${esc2(line.slice(j))}</span>`;
+          j = line.length;
+        } else {
+          let k = j;
+
+          while (
+            k < line.length &&
+            line[k] !== '/' &&
+            line[k] !== '"' &&
+            line[k] !== "'" &&
+            line[k] !== '`'
+          ) {
+            k += 1;
+          }
+
+          if (k === j) {
+            k = j + 1;
+          }
+
+          let seg = esc2(line.slice(j, k));
+
+          seg = seg.replace(
+            /\b(abstract|async|await|class|const|declare|else|export|extends|false|finally|for|from|function|if|implements|import|interface|let|new|null|override|private|protected|public|readonly|return|static|super|this|throw|true|try|type|typeof|undefined|var|void|while)\b/g,
+            '<span class="src-kw">$1</span>',
+          );
+          seg = seg.replace(
+            /\b(\d+\.?\d*)\b/g,
+            '<span class="src-nm">$1</span>',
+          );
+          out += seg;
+
+          j = k;
+        }
+      }
+
+      return ln + out;
+    })
+    .join('\n');
+}
+
 /** `file:line` → editor deep link (only when the repo is local, so the path exists). */
 function editorUrl(file: string, line: number): string {
   const abs = `${RAW.meta.root ?? ''}/${file}`.replace(/\/{2,}/g, '/');
@@ -997,7 +1233,7 @@ const kindColor = (k: string) => KIND_COLORS[k] ?? '#58a6ff';
 const EMPTY_INFO =
   '<div class="hint-row"><span class="ico">◆</span><span>Click a <b>module</b> to expand it into its symbols.</span></div>' +
   '<div class="hint-row"><span class="ico">●</span><span>Click a <b>symbol</b> to inspect it and reveal its neighbors.</span></div>' +
-  '<div class="hint-row"><span class="ico">⌕</span><span>Search to jump straight to any symbol.</span></div>';
+  '<div class="hint-row"><span class="ico">⌕</span><span><b>/</b> to search · <b>Esc</b> to deselect</span></div>';
 
 function showEmptyInfo(): void {
   infoEl.className = 'empty';
@@ -1005,6 +1241,43 @@ function showEmptyInfo(): void {
 }
 
 /* eslint-disable @typescript-eslint/no-use-before-define */
+function buildSymbolHtml(id: string, n: RawNode): string {
+  const out: Array<string> = [];
+  const inc: Array<string> = [];
+  const nodeEdges = edgesByNode.get(id);
+
+  for (const e of nodeEdges?.out ?? []) {
+    out.push(rel(e.kind, e.to));
+  }
+
+  for (const e of nodeEdges?.inc ?? []) {
+    inc.push(rel(e.kind, e.from));
+  }
+
+  const locText = `${esc(n.file)}${n.line ? `:${n.line}` : ''}`;
+  const loc = RAW.meta.root
+    ? `<a class="loc" href="${editorUrl(n.file, n.line)}" title="Open in your editor">↗ ${locText}</a>`
+    : `<span class="loc plain">${locText}</span>`;
+  const nb = (neighbors.get(id) ?? new Set()).size;
+  const sig = n.signature
+    ? `<div class="sig"><code>${esc(n.signature)}</code></div>`
+    : '';
+  // eslint-disable-next-line no-underscore-dangle
+  const srcRaw = window.__SOURCES__?.[id];
+  const srcBlock = srcRaw
+    ? `<div class="src-block"><pre>${highlightTs(srcRaw)}</pre></div>`
+    : '';
+
+  return (
+    `<div class="node-head"><span class="kind" style="background:${kindColor(n.kind)}">${esc(n.kind)}</span><span class="node-name">${esc(n.name)}</span></div>${loc}${sig}${srcBlock}` +
+    `<div class="chips"><span class="chip">${esc(groupOf(n.module))}</span><span class="chip">${degree.get(id) ?? 0} connections</span>${n.exported ? '<span class="chip ok">exported</span>' : ''}</div>` +
+    `<div class="actions">` +
+    `<button class="action" data-expand="${esc(id)}"><b>Expand neighbors</b><small>reveal its ${nb} direct link${nb === 1 ? '' : 's'} on the canvas</small></button>` +
+    `<button class="action" data-blast="${esc(id)}"><b>Blast radius</b><small>highlight everything that breaks if you change it</small></button>` +
+    `</div>${out.length ? `<div class="rel-head"><span>Uses</span><span>${out.length}</span></div>${out.join('')}` : ''}${inc.length ? `<div class="rel-head"><span>Used by</span><span>${inc.length}</span></div>${inc.join('')}` : ''}`
+  );
+}
+
 function showInfo(id: string): void {
   infoEl.className = '';
 
@@ -1028,45 +1301,7 @@ function showInfo(id: string): void {
     return;
   }
 
-  const out: Array<string> = [];
-  const inc: Array<string> = [];
-  const nodeEdges = edgesByNode.get(id);
-
-  for (const e of nodeEdges?.out ?? []) {
-    out.push(rel(e.kind, e.to));
-  }
-
-  for (const e of nodeEdges?.inc ?? []) {
-    inc.push(rel(e.kind, e.from));
-  }
-
-  const locText = `${esc(n.file)}${n.line ? `:${n.line}` : ''}`;
-  const loc = RAW.meta.root
-    ? `<a class="loc" href="${editorUrl(n.file, n.line)}" title="Open in your editor">↗ ${locText}</a>`
-    : `<span class="loc plain">${locText}</span>`;
-  const nb = (neighbors.get(id) ?? new Set()).size;
-  const sig = n.signature
-    ? `<div class="sig"><code>${esc(n.signature)}</code></div>`
-    : '';
-
-  infoEl.innerHTML =
-    `<div class="node-head"><span class="kind" style="background:${kindColor(n.kind)}">${esc(n.kind)}</span><span class="node-name">${esc(n.name)}</span></div>${
-      loc
-    }${
-      sig
-    }<div class="chips"><span class="chip">${esc(groupOf(n.module))}</span><span class="chip">${degree.get(id) ?? 0} connections</span>${n.exported ? '<span class="chip ok">exported</span>' : ''}</div>` +
-    `<div class="actions">` +
-    `<button class="action" data-expand="${esc(id)}"><b>Expand neighbors</b><small>reveal its ${nb} direct link${nb === 1 ? '' : 's'} on the canvas</small></button>` +
-    `<button class="action" data-blast="${esc(id)}"><b>Blast radius</b><small>highlight everything that breaks if you change it</small></button>` +
-    `</div>${
-      out.length
-        ? `<div class="rel-head"><span>Uses</span><span>${out.length}</span></div>${out.join('')}`
-        : ''
-    }${
-      inc.length
-        ? `<div class="rel-head"><span>Used by</span><span>${inc.length}</span></div>${inc.join('')}`
-        : ''
-    }`;
+  infoEl.innerHTML = buildSymbolHtml(id, n);
   bindInfo();
 }
 /* eslint-enable @typescript-eslint/no-use-before-define */
@@ -1219,6 +1454,58 @@ layerToggle.addEventListener('change', () => {
   syncContext();
 });
 
+const minDegEl = document.getElementById('minDeg') as HTMLInputElement;
+
+const minDegValEl = document.getElementById('minDegVal')!;
+
+minDegEl?.addEventListener('input', () => {
+  minDegreeFilter = +minDegEl.value;
+  minDegValEl.textContent = minDegEl.value;
+  render();
+});
+
+const moduleFilterEl = document.getElementById(
+  'moduleFilter',
+) as HTMLInputElement;
+
+moduleFilterEl?.addEventListener('input', () => {
+  const v = moduleFilterEl.value.trim();
+
+  try {
+    moduleFilterRx = v ? new RegExp(v, 'i') : null;
+    moduleFilterEl.style.borderColor = '';
+  } catch {
+    moduleFilterEl.style.borderColor = '#f85149';
+    moduleFilterRx = null;
+  }
+
+  render();
+});
+
+if (RAW_DIFF) {
+  const diffWrap = document.getElementById('diffToggleWrap');
+
+  if (diffWrap) {
+    diffWrap.style.display = '';
+  }
+
+  const diffLbl = document.getElementById('diffLabel');
+
+  if (diffLbl) {
+    diffLbl.textContent = `${RAW_DIFF.base}..${RAW_DIFF.head}`;
+  }
+
+  const diffToggle = document.getElementById(
+    'diffMode',
+  ) as HTMLInputElement | null;
+
+  diffToggle?.addEventListener('change', () => {
+    diffMode = diffToggle.checked;
+    sigma.refresh({ skipIndexation: true });
+    bumpFocus();
+  });
+}
+
 // ---- search (typeahead over symbols) ----
 const search = document.getElementById('search') as HTMLInputElement;
 const ac = document.getElementById('ac')!;
@@ -1285,6 +1572,27 @@ search.addEventListener('keydown', (e) => {
   } else if (e.key === 'Escape') {
     // eslint-disable-next-line @typescript-eslint/no-use-before-define
     hideAc();
+  }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (
+    e.key === '/' &&
+    !(e.target instanceof HTMLInputElement) &&
+    !(e.target instanceof HTMLTextAreaElement)
+  ) {
+    e.preventDefault();
+    search.focus();
+    search.select();
+  } else if (e.key === 'Escape') {
+    if (ac.style.display === 'block') {
+      // eslint-disable-next-line @typescript-eslint/no-use-before-define
+      hideAc();
+      search.blur();
+    } else if (selectedNode || blast) {
+      setSelected(null);
+      showEmptyInfo();
+    }
   }
 });
 

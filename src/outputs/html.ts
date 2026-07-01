@@ -1,5 +1,6 @@
 import type { Graph, GraphMeta } from '../model/types.js';
 
+import fs from 'node:fs';
 import path from 'node:path';
 
 import { EXPLORER_CLIENT } from './explorer-client.generated.js';
@@ -46,6 +47,74 @@ function repoName(meta: GraphMeta): string {
   return path.basename(meta.root ?? meta.source) || meta.source;
 }
 
+export interface DiffInfo {
+  base: string;
+  head: string;
+  changedIds: Array<string>;
+  impactedIds: Array<string>;
+}
+
+export interface HtmlOptions {
+  diff?: DiffInfo;
+}
+
+const MAX_SRC_LINES = 80;
+const MAX_SRC_TOTAL = 1_400_000;
+
+function buildSourceMap(graph: Graph): Record<string, string> {
+  const { root } = graph.meta;
+
+  if (!root) {
+    return {};
+  }
+
+  // Group embeddable nodes by file so each file is read only once.
+  type NodeSlice = { id: string; line: number; endLine: number };
+
+  const byFile = new Map<string, Array<NodeSlice>>();
+
+  for (const n of graph.nodes) {
+    const embeddable =
+      n.line > 0 &&
+      n.endLine > n.line &&
+      n.kind !== 'external' &&
+      n.kind !== 'file' &&
+      n.endLine - n.line <= MAX_SRC_LINES;
+
+    if (embeddable) {
+      const bucket = byFile.get(n.file) ?? byFile.set(n.file, []).get(n.file)!;
+
+      bucket.push({ id: n.id, line: n.line, endLine: n.endLine });
+    }
+  }
+
+  const map: Record<string, string> = {};
+
+  let total = 0;
+
+  for (const [file, slices] of byFile) {
+    if (total > MAX_SRC_TOTAL) {
+      break;
+    }
+
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename
+      const lines = fs.readFileSync(path.join(root, file), 'utf8').split('\n');
+
+      for (const { id, line, endLine } of slices) {
+        const snippet = lines.slice(line - 1, endLine).join('\n');
+
+        map[id] = snippet;
+        total += snippet.length;
+      }
+    } catch {
+      // file not readable, skip all slices from this file
+    }
+  }
+
+  return map;
+}
+
 /**
  * The Graph Explorer: a single, self-contained HTML page that renders the Code
  * Graph with Sigma (WebGL) + graphology — for a human to see the shape of a
@@ -56,7 +125,8 @@ function repoName(meta: GraphMeta): string {
  * (progressive expand/collapse, stable layout, search, info panel, edge filters)
  * lives in `src/explorer/client.ts`. This function only assembles the shell.
  */
-export function toHtml(graph: Graph): string {
+export function toHtml(graph: Graph, options: HtmlOptions = {}): string {
+  const sourceMap = buildSourceMap(graph);
   const data = embedJson({
     nodes: graph.nodes,
     edges: graph.edges,
@@ -171,6 +241,11 @@ export function toHtml(graph: Graph): string {
   #context .ctx-chip .sw { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
   #context .ctx-chip .x { color: var(--faint); font-size: 13px; line-height: 1; }
   #context .ctx-chip:hover .x { color: var(--ink); }
+  .src-block{margin-top:10px;background:#010409;border:1px solid var(--line);border-radius:8px;overflow:auto;max-height:220px}
+  .src-block pre{margin:0;padding:10px 12px;font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre}
+  .src-kw{color:#ff7b72}.src-st{color:#a5d6ff}.src-cm{color:#8b949e;font-style:italic}.src-nm{color:#79c0ff}
+  .src-ln{color:#484f58;user-select:none;display:inline-block;width:2.4em;text-align:right;margin-right:10px;border-right:1px solid #21262d;padding-right:6px}
+  #diffToggleWrap{margin-bottom:2px}
 </style>
 </head>
 <body>
@@ -202,6 +277,16 @@ export function toHtml(graph: Graph): string {
     <section id="info" class="empty"></section>
 
     <section class="card">
+      <div class="card-head"><span>Filters</span></div>
+      <div style="display:flex;align-items:center;gap:8px;font-size:12px;padding:2px 0">
+        <span style="color:var(--muted)">Min connections</span>
+        <input type="range" id="minDeg" min="0" max="20" value="0" style="flex:1;accent-color:var(--accent)">
+        <span id="minDegVal" style="color:var(--faint);font-size:11px;min-width:14px;text-align:right">0</span>
+      </div>
+      <input type="text" id="moduleFilter" placeholder="Module regex filter…" style="width:100%;margin-top:6px;padding:6px 9px;background:var(--card-2);border:1px solid var(--line-2);border-radius:6px;color:var(--ink);font:11px ui-monospace,SFMono-Regular,Menlo,monospace" />
+    </section>
+
+    <section class="card">
       <div class="card-head"><span>Modules</span><span class="badge" id="visN">0</span></div>
       <div id="moduleList"></div>
     </section>
@@ -213,6 +298,9 @@ export function toHtml(graph: Graph): string {
 
     <section class="card">
       <div class="card-head"><span>Display</span></div>
+      <div id="diffToggleWrap" style="display:none">
+        <label class="toggle"><input type="checkbox" id="diffMode"><span style="display:flex;flex-direction:column;gap:2px"><span>Diff <span id="diffLabel" style="color:var(--accent);font-size:10px"></span></span><span style="color:var(--faint);font-size:10px">changed=amber · impacted=red</span></span></label>
+      </div>
       <label class="toggle"><input type="checkbox" id="showExternals"><span>External dependencies</span></label>
       <label class="toggle"><input type="checkbox" id="colorByLayer"><span>Colour by architectural layer</span></label>
       <div id="layerLegend" style="display:none">
@@ -229,8 +317,8 @@ export function toHtml(graph: Graph): string {
 </div>
 <div id="graph"></div>
 <div id="context"></div>
-<div id="hint">drag a node · scroll = zoom · click a module to expand · click a symbol to explore</div>
-<script>window.__GRAPH__ = ${data};</script>
+<div id="hint">/ = search · Esc = deselect · drag a node · scroll = zoom · click a module to expand · click a symbol to explore</div>
+<script>${options.diff ? `window.__DIFF__ = ${embedJson(options.diff)};` : ''}window.__SOURCES__ = ${embedJson(sourceMap)};window.__GRAPH__ = ${data};</script>
 <script>${EXPLORER_CLIENT}</script>
 </body>
 </html>

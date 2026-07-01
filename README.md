@@ -18,8 +18,6 @@ Today it supports **TypeScript / JavaScript** (including JSX/React), resolved wi
 
 ## Installation
 
-Install globally from npm to use the CLI and MCP in any repo:
-
 ```bash
 npm install -g @ashulab/codegraph
 ```
@@ -51,14 +49,16 @@ codegraph init          # installs the skill + registers the MCP (user-scoped)
 `init` is idempotent and prints what it does (use `--print` for a dry run). From then
 on, in **any repo** you open, the agent has these tools:
 
-| Tool                             | What it answers                                                         |
-| -------------------------------- | ----------------------------------------------------------------------- |
-| `inspect_symbol(query)`          | a symbol's location, what it uses, who uses it, **+ its source inline** |
-| `analyze_impact(symbol, depth?)` | what breaks if you change it (transitive with `depth>1`)                |
-| `trace_path(from, to)`           | how two symbols connect                                                 |
-| `find_dead_code()`               | dead-code candidates                                                    |
-| `survey_repo()`                  | orient on an unfamiliar repo: stats + god nodes + modules               |
-| `open_explorer()`                | open the **visual** Graph Explorer in the human's browser               |
+| Tool                                     | What it answers                                                                    |
+| ---------------------------------------- | ---------------------------------------------------------------------------------- |
+| `inspect_symbol(query)`                  | a symbol's location, what it uses, who uses it, **+ its source inline**            |
+| `analyze_impact(symbol, depth?)`         | what breaks if you change it (transitive with `depth>1`)                           |
+| `trace_path(from, to)`                   | how two symbols connect                                                            |
+| `find_dead_code()`                       | dead-code candidates                                                               |
+| `survey_repo()`                          | orient on an unfamiliar repo: stats + god nodes + modules                          |
+| `search_symbols(query, limit?)`          | semantic search — find symbols by what they **do**, not by name                    |
+| `analyze_diff(base?, head?, depth?)`     | what a commit or PR diff actually breaks (maps changed files → impacted symbols)   |
+| `open_explorer()`                        | open the **visual** Graph Explorer in the human's browser                          |
 
 The MCP is **multi-repo**: each tool targets the repo you're working in (cwd) and builds
 its graph on demand — incrementally, cached under `~/.cache/codegraph/` so your repos
@@ -79,20 +79,21 @@ To run the server manually (what `init` wires up): `codegraph mcp` (stdio).
 ### Generate the graph
 
 ```bash
-codegraph <source> [--out ./graph]
+codegraph <source> [--out <dir>]
 ```
 
 Options:
 
-| Flag              | Default   | What it does                                                  |
-| ----------------- | --------- | ------------------------------------------------------------- |
-| `--out <dir>`     | `./graph` | Output folder                                                 |
-| `--ignore a,b,c`  | —         | Extra dirs to ignore (on top of `node_modules`, `dist`, etc.) |
-| `--include-tests` | off       | Include tests and mocks (excluded by default)                 |
-| `--no-cache`      | off       | Force a full rebuild (ignore the incremental cache)           |
-| `--top <n>`       | 15        | God nodes to list in the index                                |
+| Flag                  | Default   | What it does                                                  |
+| --------------------- | --------- | ------------------------------------------------------------- |
+| `--out <dir>`         | `~/.cache/codegraph/<hash>` | Output folder. Defaults to a per-repo folder under `~/.cache/codegraph/` so the repo stays clean. |
+| `--ignore a,b,c`      | —         | Extra dirs to ignore (on top of `node_modules`, `dist`, etc.) |
+| `--include-tests`     | off       | Include tests and mocks (excluded by default)                 |
+| `--no-cache`          | off       | Force a full rebuild (ignore the incremental cache)           |
+| `--top <n>`           | 15        | God nodes to list in the index                                |
+| `--with-embeddings`   | off       | Generate semantic embeddings so `search_symbols` / `codegraph query search` work offline without an API key |
 
-`<source>` can be a local path, a GitHub URL, or the `org/repo` shortcut. It generates into `--out` (default `./graph`):
+`<source>` can be a local path, a GitHub URL, or the `org/repo` shortcut. By default the output goes to `~/.cache/codegraph/<hash>/` (keyed to the repo path) so the repo stays clean — no gitignore needed. Use `--out ./graph` if you want the files in the repo instead. It generates:
 
 - `graph.json` — the full graph (nodes + edges), deterministic and portable (built on demand, not committed).
 - `GRAPH_INDEX.md` — a human-readable map for the agent: a `## Snapshot` of stats, God nodes (most connected symbols) + per-module breakdown.
@@ -125,6 +126,13 @@ codegraph query ./graph/graph.json path <A> <B>
 # Symbols with no dependents in the graph (dead-code candidates)
 codegraph query ./graph/graph.json unused
 
+# What does the last commit / a PR diff actually break?
+codegraph query ./graph/graph.json diff
+codegraph query ./graph/graph.json diff --base main --head HEAD  # branch vs main
+
+# Find symbols by description when you don't know the exact name (needs --with-embeddings)
+codegraph query ./graph/graph.json search "rate limiting logic"
+
 # Focused subgraph for a PR (Mermaid)
 codegraph mermaid ./graph/graph.json <symbol> --depth 2
 ```
@@ -152,11 +160,11 @@ In your app's `package.json`:
 ```jsonc
 {
   "devDependencies": {
-    "@ashulab/codegraph": "latest"
+    "@ashulab/codegraph": "latest",
   },
   "scripts": {
-    "graph": "codegraph . --out ./graph"
-  }
+    "graph": "codegraph . --out ./graph",
+  },
 }
 ```
 

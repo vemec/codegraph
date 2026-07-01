@@ -17,12 +17,15 @@ import { toHtml } from '../outputs/html.js';
 import { toIndexMarkdown } from '../outputs/index.js';
 import {
   blastRadius,
+  diffImpact,
   impact,
   neighbors,
   shortestPath,
   summarizeImpact,
   unused,
 } from '../query/query.js';
+import { ensureEmbeddings, semanticSearch } from '../query/semantic.js';
+import { getChangedFiles } from '../util/git-diff.js';
 import { openInBrowser } from '../util/open.js';
 import { VERSION } from '../version.js';
 
@@ -45,7 +48,7 @@ export class GraphStore {
 
   private inFlight = new Map<string, Promise<Graph>>();
 
-  private cacheDir(absRoot: string): string {
+  cacheDir(absRoot: string): string {
     const id = createHash('sha256').update(absRoot).digest('hex').slice(0, 16);
 
     return path.join(os.homedir(), '.cache', 'codegraph', id);
@@ -233,7 +236,8 @@ const TOOLS = [
       'type, for functions/methods), what it uses, who uses it, and its source code inline. Relationships ' +
       'are resolved by the TypeScript type-checker, so they are exact — not guessed by name. Your DEFAULT ' +
       "first move to understand 'what is X', 'how do I call X', 'how does X connect', 'show me X and what " +
-      "touches it' — before reaching for grep.",
+      "touches it' — before reaching for grep. " +
+      'The graph is built automatically on first call and cached — no manual build step needed.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -257,8 +261,9 @@ const TOOLS = [
       'callers, users, subclasses, interface implementers and JSX renderers that depend on it. depth=1 ' +
       '(default) summarizes the risk: how many dependents, how many are exported (the change can leak ' +
       'outside the repo), grouped by module; depth>1 returns the transitive blast radius (the whole ' +
-      "downstream chain, each tagged with its distance). Use it to gauge a change's reach. To just " +
-      'understand a symbol (not assess a change), use inspect_symbol instead.',
+      "downstream chain, each tagged with its distance). Use it to gauge a change's reach. " +
+      'Call this PROACTIVELY before any refactor — do not skip it to save a tool call. ' +
+      'To understand a symbol (not assess a change), use inspect_symbol instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -308,13 +313,77 @@ const TOOLS = [
   {
     name: 'survey_repo',
     description:
-      'Orient in an unfamiliar repo BEFORE opening files or grepping: headline stats (files, symbols, edges, ' +
+      'Index and orient in a repo: builds the code graph automatically (incremental, cached in ' +
+      '~/.cache/codegraph/ — the repo stays clean), then returns headline stats (files, symbols, edges, ' +
       "dead exports…), the most-connected 'god nodes' (touching them has wide impact), and the per-module " +
-      "breakdown. Use this first on a codebase you don't know yet.",
+      "breakdown. Use this as the FIRST call whenever the user asks to 'index', 'analyze', 'map', or " +
+      "'understand' a codebase, or before opening any files in an unfamiliar repo. " +
+      'On subsequent calls the graph is rebuilt incrementally (only changed files re-extracted).',
     inputSchema: {
       type: 'object',
       properties: {
         root: { type: 'string', description: 'Repo path. Defaults to cwd.' },
+      },
+    },
+  },
+  {
+    name: 'search_symbols',
+    description:
+      'Semantic similarity search: find symbols by meaning, not exact name. Use when you know ' +
+      'what something DOES but not what it\'s CALLED — e.g. "error handling middleware", ' +
+      '"rate limiting logic", "payment validation". Returns the top matches ranked by ' +
+      'similarity. Requires embeddings to be built first (run: `codegraph <source> ' +
+      '--with-embeddings`). If not available, the tool will build them on first call (one-time cost).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description:
+            'Free-text description of what you\'re looking for (e.g. "JWT token validation").',
+        },
+        limit: {
+          type: 'number',
+          description: 'Max results to return (default: 10).',
+        },
+        root: {
+          type: 'string',
+          description: 'Repo path. Defaults to cwd.',
+        },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'analyze_diff',
+    description:
+      'Given a git commit range, identify which symbols changed and what that impacts — ' +
+      'the blast radius of a PR or commit beyond the changed lines themselves. ' +
+      'Runs `git diff --name-only base..head`, maps changed files to graph nodes, and ' +
+      'returns the affected symbols plus their dependents. Default range is HEAD~1..HEAD (last commit). ' +
+      'depth=1 (default) gives direct dependents; depth>1 gives the transitive chain. ' +
+      'Use proactively when reviewing or about to merge a PR, or after a commit to understand its reach. ' +
+      'Requires the repo to be a git repository.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        base: {
+          type: 'string',
+          description: 'Base git ref (default: HEAD~1).',
+        },
+        head: {
+          type: 'string',
+          description: 'Head git ref (default: HEAD).',
+        },
+        depth: {
+          type: 'number',
+          description:
+            'Hops for transitive impact. 1 = direct dependents (default); >1 = transitive.',
+        },
+        root: {
+          type: 'string',
+          description: 'Repo path. Defaults to cwd.',
+        },
       },
     },
   },
@@ -351,7 +420,10 @@ type ToolContext = {
   store: GraphStore;
 };
 
-const toolHandlers: Record<string, (ctx: ToolContext) => string> = {
+const toolHandlers: Record<
+  string,
+  (ctx: ToolContext) => string | Promise<string>
+> = {
   inspect_symbol({ graph, absRoot, freshness, args }) {
     const query = String(args.query ?? '');
     const res = neighbors(graph, query);
@@ -481,6 +553,80 @@ const toolHandlers: Record<string, (ctx: ToolContext) => string> = {
         .map((n) => `${safeMeta(n.name)} (${safeMeta(n.file)})`)
         .join('\n  ↓ ') + freshness
     );
+  },
+
+  analyze_diff({ graph, absRoot, freshness, args }) {
+    const base =
+      typeof args.base === 'string' && args.base.trim() ? args.base : 'HEAD~1';
+    const head =
+      typeof args.head === 'string' && args.head.trim() ? args.head : 'HEAD';
+    const depth =
+      typeof args.depth === 'number' && args.depth > 1
+        ? Math.floor(args.depth)
+        : 1;
+
+    const changedFiles = getChangedFiles(absRoot, base, head);
+
+    if (changedFiles.length === 0) {
+      return `No files changed between ${base} and ${head} in ${absRoot}.${freshness}`;
+    }
+
+    const res = diffImpact(graph, changedFiles, depth);
+
+    const filesSection = changedFiles.map((f) => `  ${safeMeta(f)}`).join('\n');
+
+    const symbolsSection =
+      res.changedSymbols.length > 0
+        ? res.changedSymbols
+            .map(
+              (n) =>
+                `  ${safeMeta(n.kind).padEnd(10)} ${safeMeta(n.name)} (${safeMeta(n.file)}:${n.line})`,
+            )
+            .join('\n')
+        : '  (no symbols from changed files found in graph)';
+
+    const impactSection =
+      res.impacted.length > 0
+        ? res.impacted
+            .map(
+              (r) =>
+                `  [${r.distance}] ${r.via.kind.padEnd(11)} ${safeMeta(r.node.name)}${r.node.exported ? ' [exported]' : ''} (${safeMeta(r.node.file)}:${r.node.line})`,
+            )
+            .join('\n')
+        : '  (none)';
+
+    return (
+      `# Diff impact: ${safeMeta(base)}..${safeMeta(head)}\n\n` +
+      `Changed files (${changedFiles.length}):\n${filesSection}\n\n` +
+      `Changed symbols in graph (${res.changedSymbols.length}):\n${symbolsSection}\n\n` +
+      `Impacted symbols (${res.impacted.length}) — depth ${depth}:\n${impactSection}${freshness}`
+    );
+  },
+
+  async search_symbols({ graph, absRoot, freshness, args, store }) {
+    const query = String(args.query ?? '');
+    const limit =
+      typeof args.limit === 'number' && args.limit > 0
+        ? Math.floor(args.limit)
+        : 10;
+    const outDir = store.cacheDir(absRoot);
+
+    await ensureEmbeddings(graph, outDir);
+
+    const results = await semanticSearch(graph, query, outDir, limit);
+
+    if (results.length === 0) {
+      return `No semantic matches for "${query}" in ${absRoot}. The graph may have no embeddable symbols.${freshness}`;
+    }
+
+    const rows = results
+      .map(
+        (r) =>
+          `  ${(r.score * 100).toFixed(1).padStart(5)}%  ${safeMeta(r.node.kind).padEnd(10)} ${safeMeta(r.node.name)}${r.node.signature ? `  ${safeMeta(r.node.signature)}` : ''} (${safeMeta(r.node.file)}:${r.node.line})`,
+      )
+      .join('\n');
+
+    return `# Semantic search: "${query}" — top ${results.length} matches\n\n${rows}${freshness}`;
   },
 
   open_explorer({ graph, absRoot, freshness, store }) {
